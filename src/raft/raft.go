@@ -114,7 +114,7 @@ const (
 func (rf *Raft) GetState() (int, bool) {
 
 	// Your code here (2A).
-	return rf.currentTerm, rf.status == LEADER
+	return rf.getCurrentTerm(), rf.getStatus() == LEADER
 }
 
 //
@@ -206,29 +206,26 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
+	if args.Term < rf.getCurrentTerm() {
+		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
 		DPrintf("Raft服务器#%d 收到投票请求但请求的Term小于当前Term因此拒绝投票", rf.me)
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.mu.Lock()
-		rf.status = FOLLOWER
-		rf.mu.Unlock()
-
-		rf.currentTerm = args.Term
+	if args.Term > rf.getCurrentTerm() {
+		rf.setStatus(FOLLOWER)
+		rf.setCurrentTerm(args.Term)
 		rf.voteFor = nil
 		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term大于当前Term因此状态变为FOLLOWER", rf.me)
 	}
-	if rf.status == LEADER {
-		reply.Term = rf.currentTerm
+	if rf.getStatus() == LEADER {
+		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
 		DPrintf("Raft服务器#%d 收到投票请求但其为LEADER服务器，因此拒绝投票", rf.me)
 		return
 	}
-	if rf.voteFor == nil && args.LastLogIndex >= rf.commitIndex {
-		reply.Term = rf.currentTerm
+	if rf.getVoteFor() == nil && args.LastLogIndex >= rf.commitIndex {
+		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = true
 		DPrintf("Raft服务器#%d 收到投票请求并同意投票", rf.me)
 		return
@@ -327,29 +324,27 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Millisecond * time.Duration(rand.Intn(150)+150))
 
 		// 如果该server是leader的话则不需要等待心跳包
-		if rf.status == LEADER {
+		if rf.getStatus() == LEADER {
 			continue
 		}
 
-		rf.mu.Lock()
-		if !rf.heartsbeat {
+		if !rf.getHeartsbeat() {
 			// 超时未收到来自leader的心跳，状态变为candidate
-			rf.status = CANDIDATE
+			rf.setStatus(CANDIDATE)
 			DPrintf("Raft服务器#%d 超时未收到来自LEADER的心跳包，状态变为CANDIDATE\n", rf.me)
 		}
-		rf.mu.Unlock()
 
-		if rf.status == CANDIDATE {
+		if rf.getStatus() == CANDIDATE {
 			rf.election()
 		} else {
-			rf.heartsbeat = false
+			rf.setHeartsbeat(false)
 		}
 	}
 }
 
 func (rf *Raft) election() {
-	rf.currentTerm++
-	rf.voteFor = rf.peers[rf.me]
+	rf.setCurrentTerm(rf.getCurrentTerm() + 1)
+	rf.setVoteFor(rf.peers[rf.me])
 	voteSuccessChan := make(chan int, len(rf.peers))
 	resultCh := make(chan int)
 	DPrintf("Raft服务器#%d 发起投票\n", rf.me)
@@ -392,9 +387,7 @@ func (rf *Raft) election() {
 	// 如果票数大于一般则选举成功
 	switch result {
 	case ELECTION_SUCCESS:
-		rf.mu.Lock()
-		rf.status = LEADER
-		rf.mu.Unlock()
+		rf.setStatus(LEADER)
 		DPrintf("Raft服务器#%d 选举成功成为新的LEADER", rf.me)
 		// 对所有服务器发送心跳包
 		rf.sendHeartsbeat()
@@ -431,7 +424,7 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 		wg.Add(1)
 
 		requestVoteArgs := RequestVoteArgs{
-			Term:         rf.currentTerm,
+			Term:         rf.getCurrentTerm(),
 			CandidateId:  rf.me,
 			LastLogIndex: lastLogIndex,
 			LastLogTerm:  lastLogTerm,
@@ -455,27 +448,27 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 				return
 			}
 
-			if rf.status == FOLLOWER { // 状态已经变为FOLLOWER，不再有选举资格
+			if rf.getStatus() == FOLLOWER { // 状态已经变为FOLLOWER，不再有选举资格
 				select {
 				case voteResultChan <- RECONVERT_FOLLOWER:
 				default:
 				}
 				DPrintf("Raft服务器#%d 状态已经变为FOLLOWER，不再有选举资格\n", rf.me)
-			} else if requestVoteReply.Term > rf.currentTerm { // 响应中的term大于当前的term，状态变为FOLLOWER，取消选举资格
+			} else if requestVoteReply.Term > rf.getCurrentTerm() { // 响应中的term大于当前的term，状态变为FOLLOWER，取消选举资格
 				select {
 				case voteResultChan <- RECONVERT_FOLLOWER:
 				default:
 				}
 
-				rf.mu.Lock()
-				rf.status = FOLLOWER
-				rf.mu.Unlock()
-				rf.currentTerm = requestVoteReply.Term
+				rf.setStatus(FOLLOWER)
+				rf.setCurrentTerm(requestVoteReply.Term)
 				DPrintf("Raft服务器#%d 当前term:%d，收到的投票响应中的term:%d，状态变为FOLLOWER，取消选举资格\n",
-					rf.me, rf.currentTerm, requestVoteReply.Term)
+					rf.me, rf.getCurrentTerm(), requestVoteReply.Term)
 			} else {
 				if requestVoteReply.VoteGranted {
+					rf.mu.Lock()
 					voteSuccessNum++
+					rf.mu.Unlock()
 					voteSuccessChan <- 1
 					DPrintf("Raft服务器#%d 收到同意投票\n", rf.me)
 				} else {
@@ -496,7 +489,7 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 
 func (rf *Raft) sendHeartsbeat() {
 	for !rf.killed() {
-		if rf.status != LEADER {
+		if rf.getStatus() != LEADER {
 			DPrintf("Raft服务器#%d 不再是LEADER服务器，取消发送心跳包\n", rf.me)
 			return
 		}
@@ -507,7 +500,7 @@ func (rf *Raft) sendHeartsbeat() {
 			}
 			go func(server int) {
 				args := RequestAppendEntriesArgs{
-					Term:     rf.currentTerm,
+					Term:     rf.getCurrentTerm(),
 					LeaderId: rf.me,
 				}
 				reply := RequestAppendEntriesReply{}
@@ -537,19 +530,69 @@ type RequestAppendEntriesReply struct {
 
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	// code for 2A
-	rf.heartsbeat = true
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-
-		rf.mu.Lock()
-		rf.status = FOLLOWER
-		rf.mu.Unlock()
+	rf.setHeartsbeat(true)
+	rf.setHeartsbeat(true)
+	if args.Term > rf.getCurrentTerm() {
+		rf.setCurrentTerm(args.Term)
+		rf.setStatus(FOLLOWER)
 	}
 }
 
 func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) setStatus(status int) {
+	rf.mu.Lock()
+	rf.status = status
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) getStatus() int {
+	rf.mu.Lock()
+	returnVal := rf.status
+	rf.mu.Unlock()
+	return returnVal
+}
+
+func (rf *Raft) setCurrentTerm(currentTerm int) {
+	rf.mu.Lock()
+	rf.currentTerm = currentTerm
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) getCurrentTerm() int {
+	rf.mu.Lock()
+	returnVal := rf.currentTerm
+	rf.mu.Unlock()
+	return returnVal
+}
+
+func (rf *Raft) setHeartsbeat(heartsbeat bool) {
+	rf.mu.Lock()
+	rf.heartsbeat = heartsbeat
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) getHeartsbeat() bool {
+	rf.mu.Lock()
+	returnVal := rf.heartsbeat
+	rf.mu.Unlock()
+	return returnVal
+}
+
+func (rf *Raft) setVoteFor(vote *labrpc.ClientEnd) {
+	rf.mu.Lock()
+	rf.voteFor = vote
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) getVoteFor() *labrpc.ClientEnd {
+	rf.mu.Lock()
+	returnVal := rf.voteFor
+	rf.mu.Unlock()
+	return returnVal
 }
 
 //
