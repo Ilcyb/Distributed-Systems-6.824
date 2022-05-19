@@ -20,7 +20,9 @@ package raft
 import (
 	//	"bytes"
 
+	"math"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,10 +84,11 @@ type Raft struct {
 	// 是否收到leader的心跳包
 	heartsbeat bool // 在election timeout内有没有收到过来心跳包
 	status     int  // 目前自己的状态
+	applyCh    chan ApplyMsg
 }
 
 type Log struct {
-	Command string
+	Command interface{}
 	Term    int
 }
 
@@ -206,31 +209,58 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if args.Term < rf.getCurrentTerm() {
-		reply.Term = rf.getCurrentTerm()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		DPrintf("Raft服务器#%d 收到投票请求但请求的Term小于当前Term因此拒绝投票", rf.me)
 		return
 	}
-	if args.Term > rf.getCurrentTerm() {
-		rf.setStatus(FOLLOWER)
-		rf.setCurrentTerm(args.Term)
-		reply.Term = rf.getCurrentTerm()
+
+	//  the RPC includes information about the candidate’s log, and the
+	// voter denies its vote if its own log is more up-to-date than
+	// that of the candidate.
+	var lastLog Log
+	var lastLogIndex int
+	if len(rf.logs)-1 < 0 {
+		lastLog = Log{
+			Term: -1,
+		}
+		lastLogIndex = 0
+	} else {
+		lastLog = rf.logs[len(rf.logs)-1]
+		lastLogIndex = len(rf.logs)
+	}
+	if lastLog.Term > args.LastLogTerm || (lastLog.Term == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		DPrintf("Raft服务器#%d 收到投票请求但请求所包含的Log落后于自身Log因此拒绝投票", rf.me)
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.status = FOLLOWER
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
-		rf.setVoteFor(rf.peers[args.CandidateId])
+		rf.voteFor = rf.peers[args.CandidateId]
 		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term大于当前Term因此状态变为FOLLOWER并同意投票", rf.me)
 		return
 	}
-	if rf.getStatus() == LEADER {
-		reply.Term = rf.getCurrentTerm()
+
+	if rf.status == LEADER {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		DPrintf("Raft服务器#%d 收到投票请求但其为LEADER服务器，因此拒绝投票", rf.me)
 		return
 	}
-	if rf.getVoteFor() == nil && args.Term == rf.getCurrentTerm() && args.LastLogIndex >= rf.commitIndex {
-		reply.Term = rf.getCurrentTerm()
+
+	if rf.voteFor == nil && args.Term == rf.currentTerm && args.LastLogIndex >= rf.commitIndex {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
-		rf.setVoteFor(rf.peers[args.CandidateId])
+		rf.voteFor = rf.peers[args.CandidateId]
 		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term等于当前Term以及请求的日志至少与当前服务器日志相同或更新，因此同意投票", rf.me)
 		return
 	}
@@ -286,13 +316,27 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (2B).
+	DPrintf("Raft服务器#%d 收到Start请求 %v", rf.me, command)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.killed() || rf.status != LEADER {
+		return -1, -1, false
+	}
+
+	DPrintf("LEADER#%d 接收来自客户端的命令%v", rf.me, command)
+	term := rf.currentTerm
+	newLog := Log{
+		Term:    term,
+		Command: command,
+	}
+	rf.logs = append(rf.logs, newLog)
+	index := len(rf.logs)
+	rf.matchIndex[rf.me] = len(rf.logs)
+
+	return index, term, true
 }
 
 //
@@ -393,10 +437,17 @@ func (rf *Raft) election() {
 	case ELECTION_SUCCESS:
 		rf.setStatus(LEADER)
 		DPrintf("Raft服务器#%d 选举成功成为新的LEADER", rf.me)
-		// 对所有服务器发送心跳包
-		rf.sendHeartsbeat()
-		rf.nextIndex = make([]int, 0)
-		rf.matchIndex = make([]int, 0)
+		// 对所有服务器发送日志追加消息
+		rf.nextIndex = make([]int, len(rf.peers))
+		lastestIdx := len(rf.logs)
+		for i := range rf.nextIndex {
+			rf.nextIndex[i] = lastestIdx + 1
+		}
+		rf.matchIndex = make([]int, len(rf.peers))
+		for i := range rf.matchIndex {
+			rf.matchIndex[i] = 0
+		}
+		rf.appendEntriesLoop()
 	case ELECTION_FAILED:
 		DPrintf("Raft服务器#%d 选举失败", rf.me)
 	case RECONVERT_FOLLOWER:
@@ -491,29 +542,123 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 	}
 }
 
-func (rf *Raft) sendHeartsbeat() {
+func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
 		if rf.getStatus() != LEADER {
-			DPrintf("Raft服务器#%d 不再是LEADER服务器，取消发送心跳包\n", rf.me)
+			DPrintf("Raft服务器#%d 不再是LEADER服务器，取消发送日志追加消息\n", rf.me)
 			return
 		}
-		DPrintf("Raft服务器#%d 发送心跳包\n", rf.me)
+
+		DPrintf("LEADER#%d 开始追加日志，目前日志信息为%v", rf.me, rf.getLogs())
+
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
+
 			go func(server int) {
+
+				if rf.getStatus() != LEADER {
+					return
+				}
+
+				var entries []Log
+				var prevLogIndex int
+				var prevLogTerm int
+
+				prevLogIndex = rf.nextIndex[server] - 1
+				if prevLogIndex < 1 {
+					prevLogTerm = 0
+				} else {
+					prevLogTerm = rf.logs[prevLogIndex-1].Term
+				}
+				DPrintf("prevLogIndex:%d, len(rf.logs):%d", prevLogIndex, len(rf.logs))
+				for i := prevLogIndex + 1; i <= len(rf.logs); i++ {
+					entries = append(entries, rf.logs[i-1])
+				}
+
 				args := RequestAppendEntriesArgs{
-					Term:     rf.getCurrentTerm(),
-					LeaderId: rf.me,
+					Term:         rf.getCurrentTerm(),
+					LeaderId:     rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					LeaderCommit: rf.commitIndex,
 				}
 				reply := RequestAppendEntriesReply{}
+
+				if len(entries) > 0 {
+					DPrintf("Raft服务器#%d 向FOLLOWER#%d发送日志追加信息%v\n", rf.me, server, entries)
+				} else {
+					DPrintf("Raft服务器#%d 向FOLLOWER#%d发送心跳包\n", rf.me, server)
+				}
+
 				ok := rf.sendRequestAppendEntries(server, &args, &reply)
 				if !ok {
-					DPrintf("Raft服务器#%d 发送心跳包给服务器#%d失败\n", rf.me, server)
+					if len(entries) > 0 {
+						DPrintf("Raft服务器#%d 向FOLLOWER#%d发送日志追加信息，对方无响应\n", rf.me, server)
+					} else {
+						DPrintf("Raft服务器#%d 向FOLLOWER#%d发送心跳包，对方无响应\n", rf.me, server)
+					}
+					return
 				}
+
+				// follower服务器的term比leader要高，取消当前leader身份变为follower
+				if reply.Term > rf.getCurrentTerm() {
+					DPrintf("Raft服务器#%d 由于收到的响应中的Term(%d)高于自身的Term(%d)，由LEADER降级为FOLLOWER",
+						rf.me, reply.Term, rf.getCurrentTerm())
+					rf.setCurrentTerm(reply.Term)
+					rf.setStatus(FOLLOWER)
+					return
+				}
+
+				rf.mu.Lock()
+				if reply.Success {
+
+					// 心跳包
+					if len(entries) == 0 {
+						rf.mu.Unlock()
+						return
+					}
+
+					rf.nextIndex[server] = prevLogIndex + len(entries) + 1
+					// TODO 也许是我理解错了matchIndex的意思
+					rf.matchIndex[server] = prevLogIndex + len(entries)
+					DPrintf("Raft服务器#%d 成功向FOLLOWER#%d追加日志%v\n", rf.me, server, entries)
+					copyMatch := make([]int, len(rf.matchIndex))
+					copy(copyMatch, rf.matchIndex)
+
+					sort.Ints(copyMatch)
+					var mid int
+					if len(copyMatch)%2 == 0 {
+						mid = len(copyMatch)/2 - 1
+					} else {
+						mid = len(copyMatch) / 2
+					}
+					majorityMatch := copyMatch[mid]
+					DPrintf("sorted match:%v\n", copyMatch)
+					DPrintf("majority match:%d\n", majorityMatch)
+					DPrintf("rf.commitIndex:%d\n", rf.commitIndex)
+					DPrintf("rf.logs:%v\n", rf.logs)
+					if majorityMatch > rf.commitIndex && rf.logs[majorityMatch-1].Term == rf.currentTerm {
+						for i := rf.commitIndex + 1; i <= majorityMatch; i++ {
+							applyMsg := ApplyMsg{
+								CommandValid: true,
+								Command:      rf.logs[i-1].Command,
+								CommandIndex: i,
+							}
+							rf.applyCh <- applyMsg
+							DPrintf("Raft服务器#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
+						}
+						rf.commitIndex = majorityMatch
+					}
+				} else {
+					rf.nextIndex[server]--
+				}
+				rf.mu.Unlock()
 			}(i)
 		}
+
 		time.Sleep(HAERTSBEAT_INTERVAL)
 	}
 }
@@ -533,13 +678,76 @@ type RequestAppendEntriesReply struct {
 }
 
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
-	// code for 2A
-	rf.setHeartsbeat(true)
-	rf.setHeartsbeat(true)
-	if args.Term > rf.getCurrentTerm() {
-		rf.setCurrentTerm(args.Term)
-		rf.setStatus(FOLLOWER)
+	// code for 2A，2B
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.killed() {
+		reply.Success = false
+		reply.Term = -1
+		return
 	}
+
+	DPrintf("Raft服务器#%d 日志追加请求中的CommitIndex为%d 自身的CommitIndex为%d", rf.me, args.LeaderCommit, rf.commitIndex)
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		DPrintf("Raft服务器#%d 因为日志追加请求的Term(%d)小于当前Term(%d)，拒绝请求", rf.me, args.Term, rf.currentTerm)
+		return
+	}
+
+	rf.heartsbeat = true
+	rf.currentTerm = args.Term
+	rf.status = FOLLOWER
+
+	if args.PrevLogIndex > len(rf.logs) {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		DPrintf("Raft服务器#%d 因为日志追加请求的PrevLogIndex在自身日志中不存在，拒绝请求", rf.me)
+		return
+	}
+
+	// an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it
+	if args.PrevLogIndex-1 >= 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		rf.logs = rf.logs[:args.PrevLogIndex-1]
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		DPrintf("Raft服务器#%d 因为日志追加请求中包含的日志与自身的日志冲突，删除自身已存在的冲突日志并拒绝请求", rf.me)
+		return
+	}
+
+	// 空entries的心跳包
+	if len(args.Entries) == 0 {
+		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+		if args.LeaderCommit > rf.commitIndex {
+			originCommitIndex := rf.commitIndex
+			rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.logs))))
+			DPrintf("Raft服务器#%d 将commitIndex由%d更新为%d，目前日志为:%v", rf.me, originCommitIndex, rf.commitIndex, rf.logs)
+			for i := originCommitIndex + 1; i <= rf.commitIndex; i++ {
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[i-1].Command,
+					CommandIndex: i,
+				}
+				rf.applyCh <- applyMsg
+				DPrintf("Raft服务器#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
+			}
+		}
+		reply.Success = true
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// Append any new entries not already in the log
+	rf.logs = rf.logs[:args.PrevLogIndex]
+	rf.logs = append(rf.logs, args.Entries...)
+	reply.Success = true
+	reply.Term = rf.currentTerm
+	DPrintf("Raft服务器#%d 同意日志追加请求并将请求的日志%v追加至自身日志中", rf.me, args.Entries)
+
 }
 
 func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
@@ -599,6 +807,13 @@ func (rf *Raft) getVoteFor() *labrpc.ClientEnd {
 	return returnVal
 }
 
+func (rf *Raft) getLogs() []Log {
+	rf.mu.Lock()
+	returnVal := rf.logs
+	rf.mu.Unlock()
+	return returnVal
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -624,6 +839,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.heartsbeat = false
 	rf.status = FOLLOWER
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
