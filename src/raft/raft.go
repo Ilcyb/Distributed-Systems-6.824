@@ -215,8 +215,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.getCurrentTerm() {
 		rf.setStatus(FOLLOWER)
 		rf.setCurrentTerm(args.Term)
-		rf.voteFor = nil
-		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term大于当前Term因此状态变为FOLLOWER", rf.me)
+		reply.Term = rf.getCurrentTerm()
+		reply.VoteGranted = true
+		rf.setVoteFor(rf.peers[args.CandidateId])
+		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term大于当前Term因此状态变为FOLLOWER并同意投票", rf.me)
+		return
 	}
 	if rf.getStatus() == LEADER {
 		reply.Term = rf.getCurrentTerm()
@@ -224,10 +227,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("Raft服务器#%d 收到投票请求但其为LEADER服务器，因此拒绝投票", rf.me)
 		return
 	}
-	if rf.getVoteFor() == nil && args.LastLogIndex >= rf.commitIndex {
+	if rf.getVoteFor() == nil && args.Term == rf.getCurrentTerm() && args.LastLogIndex >= rf.commitIndex {
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = true
-		DPrintf("Raft服务器#%d 收到投票请求并同意投票", rf.me)
+		rf.setVoteFor(rf.peers[args.CandidateId])
+		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term等于当前Term以及请求的日志至少与当前服务器日志相同或更新，因此同意投票", rf.me)
 		return
 	}
 
