@@ -681,13 +681,13 @@ func (rf *Raft) appendEntriesLoop() {
 					} else {
 						mid = len(copyMatch) / 2
 					}
-					majorityMatch := copyMatch[mid]
-					rf.MyDPrint("LEADER#%d sorted match:%v\n", rf.me, copyMatch)
-					rf.MyDPrint("LEADER#%d majority match:%d\n", rf.me, majorityMatch)
-					rf.MyDPrint("LEADER#%d rf.commitIndex:%d\n", rf.me, rf.commitIndex)
-					rf.MyDPrint("LEADER#%d rf.logs:%v\n", rf.me, rf.Logs)
-					if majorityMatch > rf.commitIndex && rf.Logs[majorityMatch-1].Term == rf.CurrentTerm {
-						for i := rf.commitIndex + 1; i <= majorityMatch; i++ {
+					rf.commitIndex = copyMatch[mid]
+					// rf.MyDPrint("LEADER#%d sorted match:%v\n", rf.me, copyMatch)
+					// rf.MyDPrint("LEADER#%d majority match:%d\n", rf.me, majorityMatch)
+					// rf.MyDPrint("LEADER#%d rf.commitIndex:%d\n", rf.me, rf.commitIndex)
+					// rf.MyDPrint("LEADER#%d rf.logs:%v\n", rf.me, rf.Logs)
+					if rf.commitIndex > rf.lastApplied && rf.Logs[rf.commitIndex-1].Term == rf.CurrentTerm {
+						for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 							applyMsg := ApplyMsg{
 								CommandValid: true,
 								Command:      rf.Logs[i-1].Command,
@@ -696,7 +696,7 @@ func (rf *Raft) appendEntriesLoop() {
 							rf.applyCh <- applyMsg
 							rf.MyDPrint("LEADER#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
 						}
-						rf.commitIndex = majorityMatch
+						rf.lastApplied = rf.commitIndex
 					}
 				} else {
 					beforeNextIndex := rf.nextIndex[server]
@@ -825,7 +825,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 			originCommitIndex := rf.commitIndex
 			rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.Logs))))
 			rf.MyDPrint("Raft服务器#%d 将commitIndex由%d更新为%d，目前日志为:%v", rf.me, originCommitIndex, rf.commitIndex, rf.Logs)
-			for i := originCommitIndex + 1; i <= rf.commitIndex; i++ {
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				applyMsg := ApplyMsg{
 					CommandValid: true,
 					Command:      rf.Logs[i-1].Command,
@@ -834,6 +834,7 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 				rf.applyCh <- applyMsg
 				rf.MyDPrint("Raft服务器#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
 			}
+			rf.lastApplied = rf.commitIndex
 		}
 		reply.Success = true
 		reply.Term = rf.CurrentTerm
