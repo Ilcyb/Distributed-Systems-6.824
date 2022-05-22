@@ -20,6 +20,8 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -28,6 +30,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -69,9 +72,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// persistent state on all servers
-	currentTerm int               // latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	voteFor     *labrpc.ClientEnd // candidateId that received vote in current term (or null if none)
-	logs        []Log             // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+	CurrentTerm int   // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	VoteFor     int   // candidateId that received vote in current term (or null if none)
+	Logs        []Log // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
 
 	// volatile state on all servers
 	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
@@ -134,6 +137,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	rf.mu.Lock()
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VoteFor)
+	e.Encode(rf.Logs)
+	rf.mu.Unlock()
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -156,6 +168,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var logs []Log
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&logs) != nil {
+		fmt.Printf("Raft服务器#%d 读取持久化数据失败", rf.me)
+	} else {
+		rf.mu.Lock()
+		rf.CurrentTerm = currentTerm
+		rf.VoteFor = voteFor
+		rf.Logs = logs
+		rf.mu.Unlock()
+	}
 }
 
 //
@@ -210,12 +238,13 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
+	if args.Term < rf.CurrentTerm {
+		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
-		DPrintf("Raft服务器#%d 收到投票请求但请求的Term小于当前Term因此拒绝投票", rf.me)
+		rf.MyDPrint("Raft服务器#%d 收到投票请求但请求的Term小于当前Term因此拒绝投票", rf.me)
 		return
 	}
 
@@ -224,44 +253,46 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// that of the candidate.
 	var lastLog Log
 	var lastLogIndex int
-	if len(rf.logs)-1 < 0 {
+	if len(rf.Logs)-1 < 0 {
 		lastLog = Log{
 			Term: -1,
 		}
 		lastLogIndex = 0
 	} else {
-		lastLog = rf.logs[len(rf.logs)-1]
-		lastLogIndex = len(rf.logs)
+		lastLog = rf.Logs[len(rf.Logs)-1]
+		lastLogIndex = len(rf.Logs)
 	}
 	if lastLog.Term > args.LastLogTerm || (lastLog.Term == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
-		reply.Term = rf.currentTerm
+		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
-		DPrintf("Raft服务器#%d 收到投票请求但请求所包含的Log落后于自身Log因此拒绝投票", rf.me)
+		rf.MyDPrint("Raft服务器#%d 收到投票请求但请求所包含的Log落后于自身Log因此拒绝投票", rf.me)
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.CurrentTerm {
 		rf.status = FOLLOWER
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
+		rf.CurrentTerm = args.Term
+		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = true
-		rf.voteFor = rf.peers[args.CandidateId]
-		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term大于当前Term因此状态变为FOLLOWER并同意投票", rf.me)
+		rf.VoteFor = args.CandidateId
+		rf.heartsbeat = true
+		rf.MyDPrint("Raft服务器#%d 收到投票请求并且请求的Term大于当前Term因此状态变为FOLLOWER并同意投票", rf.me)
 		return
 	}
 
 	if rf.status == LEADER {
-		reply.Term = rf.currentTerm
+		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
-		DPrintf("Raft服务器#%d 收到投票请求但其为LEADER服务器，因此拒绝投票", rf.me)
+		rf.MyDPrint("Raft服务器#%d 收到投票请求但其为LEADER服务器，因此拒绝投票", rf.me)
 		return
 	}
 
-	if rf.voteFor == nil && args.Term == rf.currentTerm && args.LastLogIndex >= rf.commitIndex {
-		reply.Term = rf.currentTerm
+	if rf.VoteFor == -1 && args.Term == rf.CurrentTerm && args.LastLogIndex >= rf.commitIndex {
+		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = true
-		rf.voteFor = rf.peers[args.CandidateId]
-		DPrintf("Raft服务器#%d 收到投票请求并且请求的Term等于当前Term以及请求的日志至少与当前服务器日志相同或更新，因此同意投票", rf.me)
+		rf.VoteFor = args.CandidateId
+		rf.heartsbeat = true
+		rf.MyDPrint("Raft服务器#%d 收到投票请求并且请求的Term等于当前Term以及请求的日志至少与当前服务器日志相同或更新，因此同意投票", rf.me)
 		return
 	}
 
@@ -318,23 +349,24 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
-	DPrintf("Raft服务器#%d 收到Start请求 %v", rf.me, command)
+	// rf.MyDPrint("Raft服务器#%d 收到Start请求 %v", rf.me, command)
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	if rf.killed() || rf.status != LEADER {
 		return -1, -1, false
 	}
 
-	DPrintf("LEADER#%d 接收来自客户端的命令%v", rf.me, command)
-	term := rf.currentTerm
+	rf.MyDPrint("LEADER#%d 接收来自客户端的命令%v", rf.me, command)
+	term := rf.CurrentTerm
 	newLog := Log{
 		Term:    term,
 		Command: command,
 	}
-	rf.logs = append(rf.logs, newLog)
-	index := len(rf.logs)
-	rf.matchIndex[rf.me] = len(rf.logs)
+	rf.Logs = append(rf.Logs, newLog)
+	index := len(rf.Logs)
+	rf.matchIndex[rf.me] = len(rf.Logs)
 
 	return index, term, true
 }
@@ -368,7 +400,8 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		rand.Seed(time.Now().UnixNano())
+		rand.Seed(int64(rf.me))
+		// rand.Seed(time.Now().UnixNano())
 		time.Sleep(time.Millisecond * time.Duration(rand.Intn(150)+150))
 
 		// 如果该server是leader的话则不需要等待心跳包
@@ -379,7 +412,7 @@ func (rf *Raft) ticker() {
 		if !rf.getHeartsbeat() {
 			// 超时未收到来自leader的心跳，状态变为candidate
 			rf.setStatus(CANDIDATE)
-			DPrintf("Raft服务器#%d 超时未收到来自LEADER的心跳包，状态变为CANDIDATE\n", rf.me)
+			rf.MyDPrint("Raft服务器#%d 超时未收到来自LEADER的心跳包，状态变为CANDIDATE\n", rf.me)
 		}
 
 		if rf.getStatus() == CANDIDATE {
@@ -392,10 +425,11 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) election() {
 	rf.setCurrentTerm(rf.getCurrentTerm() + 1)
-	rf.setVoteFor(rf.peers[rf.me])
+	rf.setVoteFor(rf.me)
+	rf.persist()
 	voteSuccessChan := make(chan int, len(rf.peers))
 	resultCh := make(chan int)
-	DPrintf("Raft服务器#%d 发起投票\n", rf.me)
+	rf.MyDPrint("Raft服务器#%d 发起投票\n", rf.me)
 	go rf.sendAllElectionRequests(voteSuccessChan, resultCh)
 	voteNum := 1
 	go func() {
@@ -436,10 +470,10 @@ func (rf *Raft) election() {
 	switch result {
 	case ELECTION_SUCCESS:
 		rf.setStatus(LEADER)
-		DPrintf("Raft服务器#%d 选举成功成为新的LEADER", rf.me)
+		rf.MyDPrint("Raft服务器#%d 选举成功成为新的LEADER", rf.me)
 		// 对所有服务器发送日志追加消息
 		rf.nextIndex = make([]int, len(rf.peers))
-		lastestIdx := len(rf.logs)
+		lastestIdx := len(rf.Logs)
 		for i := range rf.nextIndex {
 			rf.nextIndex[i] = lastestIdx + 1
 		}
@@ -449,13 +483,13 @@ func (rf *Raft) election() {
 		}
 		rf.appendEntriesLoop()
 	case ELECTION_FAILED:
-		DPrintf("Raft服务器#%d 选举失败", rf.me)
+		rf.MyDPrint("Raft服务器#%d 选举失败", rf.me)
 	case RECONVERT_FOLLOWER:
-		DPrintf("Raft服务器#%d 状态为FOLLOWER，不允许参加选举", rf.me)
+		rf.MyDPrint("Raft服务器#%d 状态为FOLLOWER，不允许参加选举", rf.me)
 	case ELECTION_TIMEOUT:
-		DPrintf("Raft服务器#%d 选举超时", rf.me)
+		rf.MyDPrint("Raft服务器#%d 选举超时", rf.me)
 	case KILLED_ABORT:
-		DPrintf("Raft服务器#%d KILLED", rf.me)
+		rf.MyDPrint("Raft服务器#%d KILLED", rf.me)
 	}
 }
 
@@ -464,12 +498,12 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 	voteSuccessNum := 1
 	var lastLogIndex int
 	var lastLogTerm int
-	if len(rf.logs) == 0 {
+	if len(rf.Logs) == 0 {
 		lastLogIndex = 0
 		lastLogTerm = 0
 	} else {
-		lastLogIndex = len(rf.logs)
-		lastLogTerm = rf.logs[lastLogIndex-1].Term
+		lastLogIndex = len(rf.Logs)
+		lastLogTerm = rf.Logs[lastLogIndex-1].Term
 	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -497,9 +531,15 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 				return
 			}
 
+			// TODO 在投票之前应该判断一下自己到底还需不需要投票
+			// currentStatus := rf.getStatus()
+			// if currentStatus == LEADER {
+
+			// }
+
 			ok := rf.sendRequestVote(server, &requestVoteArgs, &requestVoteReply)
 			if !ok {
-				DPrintf("Raft服务器#%d 收到无效投票响应", rf.me)
+				rf.MyDPrint("Raft服务器#%d 无法联系#%d进行投票", rf.me, server)
 				return
 			}
 
@@ -508,7 +548,7 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 				case voteResultChan <- RECONVERT_FOLLOWER:
 				default:
 				}
-				DPrintf("Raft服务器#%d 状态已经变为FOLLOWER，不再有选举资格\n", rf.me)
+				rf.MyDPrint("Raft服务器#%d 状态已经变为FOLLOWER，不再有选举资格\n", rf.me)
 			} else if requestVoteReply.Term > rf.getCurrentTerm() { // 响应中的term大于当前的term，状态变为FOLLOWER，取消选举资格
 				select {
 				case voteResultChan <- RECONVERT_FOLLOWER:
@@ -517,7 +557,8 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 
 				rf.setStatus(FOLLOWER)
 				rf.setCurrentTerm(requestVoteReply.Term)
-				DPrintf("Raft服务器#%d 当前term:%d，收到的投票响应中的term:%d，状态变为FOLLOWER，取消选举资格\n",
+				rf.persist()
+				rf.MyDPrint("Raft服务器#%d 当前term:%d，收到的投票响应中的term:%d，状态变为FOLLOWER，取消选举资格\n",
 					rf.me, rf.getCurrentTerm(), requestVoteReply.Term)
 			} else {
 				if requestVoteReply.VoteGranted {
@@ -525,9 +566,9 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 					voteSuccessNum++
 					rf.mu.Unlock()
 					voteSuccessChan <- 1
-					DPrintf("Raft服务器#%d 收到同意投票\n", rf.me)
+					rf.MyDPrint("Raft服务器#%d 收到来自#%d的同意票\n", rf.me, server)
 				} else {
-					DPrintf("Raft服务器#%d 收到拒绝投票\n", rf.me)
+					rf.MyDPrint("Raft服务器#%d 收到来自#%d的拒绝票\n", rf.me, server)
 				}
 			}
 		}(i)
@@ -545,11 +586,11 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
 		if rf.getStatus() != LEADER {
-			DPrintf("Raft服务器#%d 不再是LEADER服务器，取消发送日志追加消息\n", rf.me)
+			rf.MyDPrint("Raft服务器#%d 不再是LEADER服务器，取消发送日志追加消息\n", rf.me)
 			return
 		}
 
-		DPrintf("LEADER#%d 开始追加日志，目前日志信息为%v", rf.me, rf.getLogs())
+		rf.MyDPrint("LEADER#%d 开始追加日志，目前日志信息为%v", rf.me, rf.getLogs())
 
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
@@ -558,23 +599,19 @@ func (rf *Raft) appendEntriesLoop() {
 
 			go func(server int) {
 
-				if rf.getStatus() != LEADER {
-					return
-				}
-
 				var entries []Log
 				var prevLogIndex int
 				var prevLogTerm int
 
 				prevLogIndex = rf.nextIndex[server] - 1
 				if prevLogIndex < 1 {
-					prevLogTerm = 0
+					prevLogTerm = -1
 				} else {
-					prevLogTerm = rf.logs[prevLogIndex-1].Term
+					prevLogTerm = rf.Logs[prevLogIndex-1].Term
 				}
-				DPrintf("prevLogIndex:%d, len(rf.logs):%d", prevLogIndex, len(rf.logs))
-				for i := prevLogIndex + 1; i <= len(rf.logs); i++ {
-					entries = append(entries, rf.logs[i-1])
+
+				for i := prevLogIndex + 1; i <= len(rf.Logs); i++ {
+					entries = append(entries, rf.Logs[i-1])
 				}
 
 				args := RequestAppendEntriesArgs{
@@ -587,27 +624,35 @@ func (rf *Raft) appendEntriesLoop() {
 				}
 				reply := RequestAppendEntriesReply{}
 
+				if rf.getStatus() != LEADER {
+					rf.MyDPrint("Raft服务器#%d 不再是LEADER服务器，取消对#%d发送日志追加消息\n", rf.me, server)
+					return
+				}
+
+				rf.MyDPrint("LEADER#%d 向FOLLOWER#%d发送的日志追加参数prevLogIndex:%d, len(rf.logs):%d",
+					rf.me, server, prevLogIndex, len(rf.Logs))
 				if len(entries) > 0 {
-					DPrintf("Raft服务器#%d 向FOLLOWER#%d发送日志追加信息%v\n", rf.me, server, entries)
+					rf.MyDPrint("LEADER#%d 向FOLLOWER#%d发送日志追加信息%v\n", rf.me, server, entries)
 				} else {
-					DPrintf("Raft服务器#%d 向FOLLOWER#%d发送心跳包\n", rf.me, server)
+					rf.MyDPrint("LEADER#%d 向FOLLOWER#%d发送心跳包\n", rf.me, server)
 				}
 
 				ok := rf.sendRequestAppendEntries(server, &args, &reply)
 				if !ok {
 					if len(entries) > 0 {
-						DPrintf("Raft服务器#%d 向FOLLOWER#%d发送日志追加信息，对方无响应\n", rf.me, server)
+						rf.MyDPrint("LEADER#%d 向FOLLOWER#%d发送日志追加信息，对方无响应\n", rf.me, server)
 					} else {
-						DPrintf("Raft服务器#%d 向FOLLOWER#%d发送心跳包，对方无响应\n", rf.me, server)
+						rf.MyDPrint("LEADER#%d 向FOLLOWER#%d发送心跳包，对方无响应\n", rf.me, server)
 					}
 					return
 				}
 
 				// follower服务器的term比leader要高，取消当前leader身份变为follower
 				if reply.Term > rf.getCurrentTerm() {
-					DPrintf("Raft服务器#%d 由于收到的响应中的Term(%d)高于自身的Term(%d)，由LEADER降级为FOLLOWER",
+					rf.MyDPrint("LEADER#%d 由于收到的响应中的Term(%d)高于自身的Term(%d)，由LEADER降级为FOLLOWER",
 						rf.me, reply.Term, rf.getCurrentTerm())
 					rf.setCurrentTerm(reply.Term)
+					rf.persist()
 					rf.setStatus(FOLLOWER)
 					return
 				}
@@ -621,10 +666,11 @@ func (rf *Raft) appendEntriesLoop() {
 						return
 					}
 
+					// 计算出应该提交的日志
 					rf.nextIndex[server] = prevLogIndex + len(entries) + 1
 					// TODO 也许是我理解错了matchIndex的意思
 					rf.matchIndex[server] = prevLogIndex + len(entries)
-					DPrintf("Raft服务器#%d 成功向FOLLOWER#%d追加日志%v\n", rf.me, server, entries)
+					rf.MyDPrint("LEADER#%d 成功向FOLLOWER#%d追加日志%v\n", rf.me, server, entries)
 					copyMatch := make([]int, len(rf.matchIndex))
 					copy(copyMatch, rf.matchIndex)
 
@@ -636,24 +682,43 @@ func (rf *Raft) appendEntriesLoop() {
 						mid = len(copyMatch) / 2
 					}
 					majorityMatch := copyMatch[mid]
-					DPrintf("sorted match:%v\n", copyMatch)
-					DPrintf("majority match:%d\n", majorityMatch)
-					DPrintf("rf.commitIndex:%d\n", rf.commitIndex)
-					DPrintf("rf.logs:%v\n", rf.logs)
-					if majorityMatch > rf.commitIndex && rf.logs[majorityMatch-1].Term == rf.currentTerm {
+					rf.MyDPrint("LEADER#%d sorted match:%v\n", rf.me, copyMatch)
+					rf.MyDPrint("LEADER#%d majority match:%d\n", rf.me, majorityMatch)
+					rf.MyDPrint("LEADER#%d rf.commitIndex:%d\n", rf.me, rf.commitIndex)
+					rf.MyDPrint("LEADER#%d rf.logs:%v\n", rf.me, rf.Logs)
+					if majorityMatch > rf.commitIndex && rf.Logs[majorityMatch-1].Term == rf.CurrentTerm {
 						for i := rf.commitIndex + 1; i <= majorityMatch; i++ {
 							applyMsg := ApplyMsg{
 								CommandValid: true,
-								Command:      rf.logs[i-1].Command,
+								Command:      rf.Logs[i-1].Command,
 								CommandIndex: i,
 							}
 							rf.applyCh <- applyMsg
-							DPrintf("Raft服务器#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
+							rf.MyDPrint("LEADER#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
 						}
 						rf.commitIndex = majorityMatch
 					}
 				} else {
-					rf.nextIndex[server]--
+					beforeNextIndex := rf.nextIndex[server]
+					// optimized to reduce the number of rejected AppendEntries RPCs.
+					if reply.Conflict {
+						rf.MyDPrint("标识标识! 收到ConflictTermFirstIndex:%d", reply.ConflictTermFirstIndex)
+						if reply.ConflictTermFirstIndex == 0 {
+							rf.nextIndex[server] = 1
+						} else {
+							if rf.Logs[reply.ConflictTermFirstIndex-1].Term == reply.ConflictTerm {
+								rf.nextIndex[server] = reply.ConflictTermFirstIndex + 1
+							} else {
+								rf.nextIndex[server] = reply.ConflictTermFirstIndex
+							}
+						}
+					} else {
+						if rf.nextIndex[server] > 1 {
+							rf.nextIndex[server]--
+						}
+					}
+					rf.MyDPrint("LEADER#%d 向FOLLOWER#%d发起的日志追加请求被拒绝，将NextIndex由%d修改为%d",
+						rf.me, server, beforeNextIndex, rf.nextIndex[server])
 				}
 				rf.mu.Unlock()
 			}(i)
@@ -675,11 +740,17 @@ type RequestAppendEntriesArgs struct {
 type RequestAppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+
+	// optimization
+	Conflict               bool
+	ConflictTerm           int
+	ConflictTermFirstIndex int
 }
 
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
 	// code for 2A，2B
 	rf.mu.Lock()
+	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	if rf.killed() {
@@ -688,34 +759,62 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		return
 	}
 
-	DPrintf("Raft服务器#%d 日志追加请求中的CommitIndex为%d 自身的CommitIndex为%d", rf.me, args.LeaderCommit, rf.commitIndex)
+	rf.MyDPrint("Raft服务器#%d 日志追加请求中的CommitIndex为%d 自身的CommitIndex为%d", rf.me, args.LeaderCommit, rf.commitIndex)
 
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.CurrentTerm {
 		reply.Success = false
-		reply.Term = rf.currentTerm
-		DPrintf("Raft服务器#%d 因为日志追加请求的Term(%d)小于当前Term(%d)，拒绝请求", rf.me, args.Term, rf.currentTerm)
+		reply.Term = rf.CurrentTerm
+		rf.MyDPrint("Raft服务器#%d 因为日志追加请求的Term(%d)小于当前Term(%d)，拒绝请求", rf.me, args.Term, rf.CurrentTerm)
 		return
 	}
 
 	rf.heartsbeat = true
-	rf.currentTerm = args.Term
-	rf.status = FOLLOWER
+	rf.CurrentTerm = args.Term
+	if rf.status != FOLLOWER {
+		rf.MyDPrint("Raft服务器#%d 收到来自LEADER#%d的合法日志追加请求，因此状态变为FOLLOWER")
+		rf.status = FOLLOWER
+	}
 
-	if args.PrevLogIndex > len(rf.logs) {
+	if args.PrevLogIndex > len(rf.Logs) {
+		var conflictTerm int
+		var conflictTermFirstIndex int
+		if len(rf.Logs) == 0 {
+			conflictTerm = -1
+			conflictTermFirstIndex = 0
+		} else {
+			conflictTerm = rf.Logs[len(rf.Logs)-1].Term
+			for i := 1; i <= len(rf.Logs); i++ {
+				if rf.Logs[i-1].Term == reply.ConflictTerm {
+					conflictTermFirstIndex = i
+					break
+				}
+			}
+		}
+		reply.Conflict = true
+		reply.ConflictTerm = conflictTerm
+		reply.ConflictTermFirstIndex = conflictTermFirstIndex
 		reply.Success = false
-		reply.Term = rf.currentTerm
-		DPrintf("Raft服务器#%d 因为日志追加请求的PrevLogIndex在自身日志中不存在，拒绝请求", rf.me)
+		reply.Term = rf.CurrentTerm
+		rf.MyDPrint("Raft服务器#%d 因为日志追加请求的PrevLogIndex在自身日志中不存在，拒绝请求", rf.me)
 		return
 	}
 
 	// an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it
-	if args.PrevLogIndex-1 >= 0 && rf.logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-		rf.logs = rf.logs[:args.PrevLogIndex-1]
+	if args.PrevLogIndex-1 >= 0 && rf.Logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		reply.Conflict = true
+		reply.ConflictTerm = rf.Logs[args.PrevLogIndex-1].Term
+		for i := 1; i <= len(rf.Logs); i++ {
+			if rf.Logs[i-1].Term == reply.ConflictTerm {
+				reply.ConflictTermFirstIndex = i
+				break
+			}
+		}
+		rf.Logs = rf.Logs[:args.PrevLogIndex-1]
 		reply.Success = false
-		reply.Term = rf.currentTerm
-		DPrintf("Raft服务器#%d 因为日志追加请求中包含的日志与自身的日志冲突，删除自身已存在的冲突日志并拒绝请求", rf.me)
+		reply.Term = rf.CurrentTerm
+		rf.MyDPrint("Raft服务器#%d 因为日志追加请求中包含的日志与自身的日志冲突，删除自身已存在的冲突日志并拒绝请求", rf.me)
 		return
 	}
 
@@ -724,29 +823,29 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.commitIndex {
 			originCommitIndex := rf.commitIndex
-			rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.logs))))
-			DPrintf("Raft服务器#%d 将commitIndex由%d更新为%d，目前日志为:%v", rf.me, originCommitIndex, rf.commitIndex, rf.logs)
+			rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.Logs))))
+			rf.MyDPrint("Raft服务器#%d 将commitIndex由%d更新为%d，目前日志为:%v", rf.me, originCommitIndex, rf.commitIndex, rf.Logs)
 			for i := originCommitIndex + 1; i <= rf.commitIndex; i++ {
 				applyMsg := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.logs[i-1].Command,
+					Command:      rf.Logs[i-1].Command,
 					CommandIndex: i,
 				}
 				rf.applyCh <- applyMsg
-				DPrintf("Raft服务器#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
+				rf.MyDPrint("Raft服务器#%d 向客户端提交已确认的请求%v", rf.me, applyMsg)
 			}
 		}
 		reply.Success = true
-		reply.Term = rf.currentTerm
+		reply.Term = rf.CurrentTerm
 		return
 	}
 
 	// Append any new entries not already in the log
-	rf.logs = rf.logs[:args.PrevLogIndex]
-	rf.logs = append(rf.logs, args.Entries...)
+	rf.Logs = rf.Logs[:args.PrevLogIndex]
+	rf.Logs = append(rf.Logs, args.Entries...)
 	reply.Success = true
-	reply.Term = rf.currentTerm
-	DPrintf("Raft服务器#%d 同意日志追加请求并将请求的日志%v追加至自身日志中", rf.me, args.Entries)
+	reply.Term = rf.CurrentTerm
+	rf.MyDPrint("Raft服务器#%d 同意日志追加请求并将请求的日志%v追加至自身日志中", rf.me, args.Entries)
 
 }
 
@@ -770,13 +869,13 @@ func (rf *Raft) getStatus() int {
 
 func (rf *Raft) setCurrentTerm(currentTerm int) {
 	rf.mu.Lock()
-	rf.currentTerm = currentTerm
+	rf.CurrentTerm = currentTerm
 	rf.mu.Unlock()
 }
 
 func (rf *Raft) getCurrentTerm() int {
 	rf.mu.Lock()
-	returnVal := rf.currentTerm
+	returnVal := rf.CurrentTerm
 	rf.mu.Unlock()
 	return returnVal
 }
@@ -794,22 +893,22 @@ func (rf *Raft) getHeartsbeat() bool {
 	return returnVal
 }
 
-func (rf *Raft) setVoteFor(vote *labrpc.ClientEnd) {
+func (rf *Raft) setVoteFor(vote int) {
 	rf.mu.Lock()
-	rf.voteFor = vote
+	rf.VoteFor = vote
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) getVoteFor() *labrpc.ClientEnd {
+func (rf *Raft) getVoteFor() int {
 	rf.mu.Lock()
-	returnVal := rf.voteFor
+	returnVal := rf.VoteFor
 	rf.mu.Unlock()
 	return returnVal
 }
 
 func (rf *Raft) getLogs() []Log {
 	rf.mu.Lock()
-	returnVal := rf.logs
+	returnVal := rf.Logs
 	rf.mu.Unlock()
 	return returnVal
 }
@@ -833,13 +932,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0
-	rf.logs = make([]Log, 0)
+	rf.CurrentTerm = 0
+	rf.Logs = make([]Log, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.heartsbeat = false
 	rf.status = FOLLOWER
 	rf.applyCh = applyCh
+	rf.VoteFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
