@@ -61,6 +61,7 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
+	// mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -88,6 +89,9 @@ type Raft struct {
 	heartsbeat bool // 在election timeout内有没有收到过来心跳包
 	status     int  // 目前自己的状态
 	applyCh    chan ApplyMsg
+
+	// snapshot
+	XIndex int
 }
 
 type Log struct {
@@ -123,6 +127,17 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.getCurrentTerm(), rf.getStatus() == LEADER
 }
 
+func (rf *Raft) getEncodeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	rf.mu.Lock()
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VoteFor)
+	e.Encode(rf.Logs)
+	rf.mu.Unlock()
+	return w.Bytes()
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -137,14 +152,8 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	rf.mu.Lock()
-	e.Encode(rf.CurrentTerm)
-	e.Encode(rf.VoteFor)
-	e.Encode(rf.Logs)
-	rf.mu.Unlock()
-	data := w.Bytes()
+
+	data := rf.getEncodeState()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -203,6 +212,23 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+
+	rf.mu.Lock()
+	if index > rf.getLogLen() || index <= rf.XIndex {
+		rf.mu.Unlock()
+		return
+	}
+	MyDebug(dSnap, "S%d snapshot INDEX:%d LAST_XINDEX:%d", rf.me, index, rf.XIndex)
+	indexLag := index - rf.XIndex
+	rf.XIndex = index
+	// snapshot 不包括splitIndex所指的log 如果需要包括的话要把 indexLag-1 改为 indexLag
+	lastIncludeIndex := indexLag
+	newLogs := make([]Log, len(rf.Logs)-lastIncludeIndex)
+	copy(newLogs, rf.Logs[lastIncludeIndex:])
+	rf.Logs = newLogs
+	rf.mu.Unlock()
+
+	rf.persister.SaveStateAndSnapshot(rf.getEncodeState(), snapshot)
 }
 
 //
@@ -250,17 +276,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//  the RPC includes information about the candidate’s log, and the
 	// voter denies its vote if its own log is more up-to-date than
 	// that of the candidate.
-	var lastLog Log
-	var lastLogIndex int
-	if len(rf.Logs)-1 < 0 {
-		lastLog = Log{
-			Term: -1,
-		}
-		lastLogIndex = 0
-	} else {
-		lastLog = rf.Logs[len(rf.Logs)-1]
-		lastLogIndex = len(rf.Logs)
-	}
+	// if len(rf.Logs)-1 < 0 {
+	// 	lastLog = Log{
+	// 		Term: -1,
+	// 	}
+	// 	lastLogIndex = 0
+	// } else {
+	// 	lastLog = rf.Logs[len(rf.Logs)-1]
+	// 	lastLogIndex = len(rf.Logs)
+	// }
+	lastLogIndex := rf.getLogLen()
+	lastLog := rf.getLog(lastLogIndex)
 	if lastLog.Term > args.LastLogTerm || (lastLog.Term == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
@@ -367,8 +393,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.Logs = append(rf.Logs, newLog)
-	index := len(rf.Logs)
-	rf.matchIndex[rf.me] = len(rf.Logs)
+	// index := len(rf.Logs)
+	index := rf.getLogLen()
+	rf.matchIndex[rf.me] = index
 
 	return index, term, true
 }
@@ -476,7 +503,8 @@ func (rf *Raft) election() {
 		MyDebug(dStatus, "S%d -> LEADER", rf.me)
 		// 对所有服务器发送日志追加消息
 		rf.nextIndex = make([]int, len(rf.peers))
-		lastestIdx := len(rf.Logs)
+		// lastestIdx := len(rf.Logs)
+		lastestIdx := rf.getLogLen()
 		for i := range rf.nextIndex {
 			rf.nextIndex[i] = lastestIdx + 1
 		}
@@ -501,12 +529,15 @@ func (rf *Raft) sendAllElectionRequests(voteSuccessChan chan int, voteResultChan
 	voteSuccessNum := 1
 	var lastLogIndex int
 	var lastLogTerm int
-	if len(rf.Logs) == 0 {
+	// if len(rf.Logs) == 0 {
+	if rf.getLogLen() == 0 {
 		lastLogIndex = 0
 		lastLogTerm = 0
 	} else {
-		lastLogIndex = len(rf.Logs)
-		lastLogTerm = rf.Logs[lastLogIndex-1].Term
+		// lastLogIndex = len(rf.Logs)
+		lastLogIndex = rf.getLogLen()
+		// lastLogTerm = rf.Logs[lastLogIndex-1].Term
+		lastLogTerm = rf.getLog(lastLogIndex).Term
 	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -604,16 +635,20 @@ func (rf *Raft) appendEntriesLoop() {
 				var prevLogIndex int
 				var prevLogTerm int
 
+				rf.mu.Lock()
 				prevLogIndex = rf.nextIndex[server] - 1
 				if prevLogIndex < 1 {
 					prevLogTerm = -1
 				} else {
-					prevLogTerm = rf.Logs[prevLogIndex-1].Term
+					// prevLogTerm = rf.Logs[prevLogIndex-1].Term
+					prevLogTerm = rf.getLog(prevLogIndex).Term
 				}
 
-				for i := prevLogIndex + 1; i <= len(rf.Logs); i++ {
-					entries = append(entries, rf.Logs[i-1])
+				for i := prevLogIndex + 1; i <= rf.getLogLen(); i++ {
+					// entries = append(entries, rf.Logs[i-1])
+					entries = append(entries, rf.getLog(i))
 				}
+				rf.mu.Unlock()
 
 				args := RequestAppendEntriesArgs{
 					Term:         rf.getCurrentTerm(),
@@ -651,16 +686,15 @@ func (rf *Raft) appendEntriesLoop() {
 					return
 				}
 
-				rf.mu.Lock()
 				if reply.Success {
 
 					// 心跳包
 					if len(entries) == 0 {
-						rf.mu.Unlock()
 						return
 					}
 
 					// 计算出应该提交的日志
+					rf.mu.Lock()
 					rf.nextIndex[server] = prevLogIndex + len(entries) + 1
 					// TODO 也许是我理解错了matchIndex的意思
 					rf.matchIndex[server] = prevLogIndex + len(entries)
@@ -680,26 +714,37 @@ func (rf *Raft) appendEntriesLoop() {
 					// rf.MyDPrint("LEADER#%d majority match:%d\n", rf.me, majorityMatch)
 					// rf.MyDPrint("LEADER#%d rf.commitIndex:%d\n", rf.me, rf.commitIndex)
 					// rf.MyDPrint("LEADER#%d rf.logs:%v\n", rf.me, rf.Logs)
-					if rf.commitIndex > rf.lastApplied && rf.Logs[rf.commitIndex-1].Term == rf.CurrentTerm {
+					// if rf.commitIndex > rf.lastApplied && rf.Logs[rf.commitIndex-1].Term == rf.CurrentTerm {
+					needApplyMsgs := make([]ApplyMsg, 0)
+					if rf.commitIndex > rf.lastApplied && rf.getLog(rf.commitIndex).Term == rf.CurrentTerm {
 						for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 							applyMsg := ApplyMsg{
 								CommandValid: true,
-								Command:      rf.Logs[i-1].Command,
+								// Command:      rf.Logs[i-1].Command,
+								Command:      rf.getLog(i).Command,
 								CommandIndex: i,
 							}
-							rf.applyCh <- applyMsg
+							// rf.applyCh <- applyMsg
+							needApplyMsgs = append(needApplyMsgs, applyMsg)
 							MyDebug(dCommit, "S%d -> Client MSG:%v", rf.me, applyMsg)
 						}
 						rf.lastApplied = rf.commitIndex
 					}
+					rf.mu.Unlock()
+
+					for _, applyMsg := range needApplyMsgs {
+						rf.applyCh <- applyMsg
+					}
 				} else {
+					rf.mu.Lock()
 					beforeNextIndex := rf.nextIndex[server]
 					// optimized to reduce the number of rejected AppendEntries RPCs.
 					if reply.Conflict {
 						if reply.ConflictTermFirstIndex == 0 {
 							rf.nextIndex[server] = 1
 						} else {
-							if rf.Logs[reply.ConflictTermFirstIndex-1].Term == reply.ConflictTerm {
+							// if rf.Logs[reply.ConflictTermFirstIndex-1].Term == reply.ConflictTerm {
+							if rf.getLog(reply.ConflictTermFirstIndex).Term == reply.ConflictTerm {
 								rf.nextIndex[server] = reply.ConflictTermFirstIndex + 1
 							} else {
 								rf.nextIndex[server] = reply.ConflictTermFirstIndex
@@ -712,8 +757,9 @@ func (rf *Raft) appendEntriesLoop() {
 					}
 					MyDebug(dLog, "S%d <- S%d refused append log", rf.me, server)
 					MyDebug(dLog, "S%d -> S%d change NextIndex %d -> %d", rf.me, server, beforeNextIndex, rf.nextIndex[server])
+					rf.mu.Unlock()
 				}
-				rf.mu.Unlock()
+				// rf.mu.Unlock()
 			}(i)
 		}
 
@@ -770,16 +816,20 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.status = FOLLOWER
 	}
 
-	if args.PrevLogIndex > len(rf.Logs) {
+	// if args.PrevLogIndex > len(rf.Logs) {
+	if args.PrevLogIndex > rf.getLogLen() {
 		var conflictTerm int
 		var conflictTermFirstIndex int
-		if len(rf.Logs) == 0 {
+		// if len(rf.Logs) == 0 {
+		if rf.getLogLen() == 0 {
 			conflictTerm = -1
 			conflictTermFirstIndex = 0
 		} else {
-			conflictTerm = rf.Logs[len(rf.Logs)-1].Term
+			// conflictTerm = rf.Logs[len(rf.Logs)-1].Term
+			conflictTerm = rf.getLog(rf.getLogLen()).Term
 			for i := 1; i <= len(rf.Logs); i++ {
-				if rf.Logs[i-1].Term == reply.ConflictTerm {
+				// if rf.Logs[i-1].Term == reply.ConflictTerm {
+				if rf.getLog(i).Term == reply.ConflictTerm {
 					conflictTermFirstIndex = i
 					break
 				}
@@ -791,23 +841,26 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
 		MyDebug(dLog, "S%d -> S%d refuse log append - requests.PrevLogIndex(%d) > logs len(%d)",
-			rf.me, args.LeaderId, args.PrevLogIndex, len(rf.Logs))
+			rf.me, args.LeaderId, args.PrevLogIndex, rf.getLogLen())
 		return
 	}
 
 	// an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it
-	if args.PrevLogIndex-1 >= 0 && rf.Logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+	// if args.PrevLogIndex-1 >= 0 && rf.Logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+	if args.PrevLogIndex-1 >= 0 && rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm {
 		reply.Conflict = true
-		reply.ConflictTerm = rf.Logs[args.PrevLogIndex-1].Term
-		for i := 1; i <= len(rf.Logs); i++ {
-			if rf.Logs[i-1].Term == reply.ConflictTerm {
+		reply.ConflictTerm = rf.getLog(args.PrevLogIndex).Term
+		for i := 1; i <= rf.getLogLen(); i++ {
+			// if rf.Logs[i-1].Term == reply.ConflictTerm {
+			if rf.getLog(i).Term == reply.ConflictTerm {
 				reply.ConflictTermFirstIndex = i
 				break
 			}
 		}
-		rf.Logs = rf.Logs[:args.PrevLogIndex-1]
+		// rf.Logs = rf.Logs[:args.PrevLogIndex-1]
+		rf.Logs = rf.Logs[:args.PrevLogIndex-1-rf.XIndex]
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
 		MyDebug(dLog, "S%d -> S%d refuse log append - log conflict", rf.me, args.LeaderId)
@@ -819,18 +872,27 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.commitIndex {
 			originCommitIndex := rf.commitIndex
-			rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.Logs))))
+			rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.getLogLen())))
 			MyDebug(dCommit, "S%d commidIndex %d -> %d LOGS:%v", rf.me, originCommitIndex, rf.commitIndex, rf.Logs)
+			needApplyMsgs := make([]ApplyMsg, 0)
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				applyMsg := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.Logs[i-1].Command,
+					// Command:      rf.Logs[i-1].Command,
+					Command:      rf.getLog(i).Command,
 					CommandIndex: i,
 				}
-				rf.applyCh <- applyMsg
+				needApplyMsgs = append(needApplyMsgs, applyMsg)
 				MyDebug(dCommit, "S%d -> Client MSG:%v", rf.me, applyMsg)
 			}
 			rf.lastApplied = rf.commitIndex
+
+			// 为了不和snapshot发生死锁
+			rf.mu.Unlock()
+			for _, applyMsg := range needApplyMsgs {
+				rf.applyCh <- applyMsg
+			}
+			rf.mu.Lock()
 		}
 		reply.Success = true
 		reply.Term = rf.CurrentTerm
@@ -838,7 +900,8 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	}
 
 	// Append any new entries not already in the log
-	rf.Logs = rf.Logs[:args.PrevLogIndex]
+	// rf.Logs = rf.Logs[:args.PrevLogIndex]
+	rf.Logs = rf.Logs[:args.PrevLogIndex-rf.XIndex]
 	rf.Logs = append(rf.Logs, args.Entries...)
 	reply.Success = true
 	reply.Term = rf.CurrentTerm
@@ -910,6 +973,38 @@ func (rf *Raft) getLogs() []Log {
 	return returnVal
 }
 
+func (rf *Raft) getLog(index int) Log {
+	logLen := len(rf.Logs) + rf.XIndex
+
+	if index == -1 {
+		if logLen == 0 {
+			return Log{Term: -1}
+		}
+		return rf.Logs[len(rf.Logs)-1]
+	}
+
+	if logLen == 0 || index < 1 || index > logLen {
+		return Log{Term: -1}
+	}
+
+	MyDebug(dTrace, "logTotalLen:%d len(logs):%d X:%d requestIndex:%d index-rf.XIndex-1:%d",
+		logLen, len(rf.Logs), rf.XIndex, index, index-rf.XIndex-1)
+	return rf.Logs[index-rf.XIndex-1]
+}
+
+func (rf *Raft) setLog(index int, log Log) {
+	if index <= rf.XIndex {
+		MyDebug(dError, "S%d - set log of campacted logs SET_INDEX:%d XINDEX:%d", rf.me, index, rf.XIndex)
+		return
+	}
+
+	rf.Logs[index-rf.XIndex-1] = log
+}
+
+func (rf *Raft) getLogLen() int {
+	return rf.XIndex + len(rf.Logs)
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -937,6 +1032,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.status = FOLLOWER
 	rf.applyCh = applyCh
 	rf.VoteFor = -1
+	rf.XIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
