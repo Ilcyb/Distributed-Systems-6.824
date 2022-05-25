@@ -58,6 +58,11 @@ func (rf *Raft) appendEntries(server int) {
 
 	rf.mu.Lock()
 	prevLogIndex = rf.nextIndex[server] - 1
+	if prevLogIndex < rf.LastIncludedIndex {
+		rf.mu.Unlock()
+		go rf.appendSnapshot(server)
+		return
+	}
 	if prevLogIndex < 1 {
 		prevLogTerm = -1
 	} else {
@@ -243,6 +248,15 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	// but different terms), delete the existing entry and all that
 	// follow it
 	// if args.PrevLogIndex-1 >= 0 && rf.Logs[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+
+	if args.PrevLogIndex < rf.LastIncludedIndex {
+		reply.Success = false
+		reply.Term = rf.CurrentTerm
+		MyDebug(dLog, "S%d -> S%d refuse log append request - args.PLIndex(%d) < self.LTTnidex(%d)",
+			rf.me, args.LeaderId, args.PrevLogIndex, rf.LastIncludedIndex)
+		return
+	}
+
 	if args.PrevLogIndex-1 >= 0 && rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm {
 		reply.Conflict = true
 		reply.ConflictTerm = rf.getLog(args.PrevLogIndex).Term

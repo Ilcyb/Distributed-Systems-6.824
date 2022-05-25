@@ -192,6 +192,7 @@ func (rf *Raft) election() {
 		for i := range rf.matchIndex {
 			rf.matchIndex[i] = 0
 		}
+		// rf.matchIndex[rf.me] = lastestIdx
 		go rf.appendEntriesLoop()
 	case ELECTION_FAILED:
 		MyDebug(dVote, "S%d failed election", rf.me)

@@ -118,12 +118,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.me, args.LeaderId, rf.LastIncludedIndex)
 	rf.mu.Unlock()
 	rf.persister.SaveStateAndSnapshot(rf.getEncodeState(), args.Data)
-	rf.applyCh <- ApplyMsg{
+	rf.mu.Lock()
+	applyMsg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  rf.LastIncludedTerm,
+		SnapshotIndex: rf.LastIncludedIndex,
 	}
+	rf.mu.Unlock()
+
+	rf.applyCh <- applyMsg
 }
 
 func (rf *Raft) appendSnapshot(server int) {

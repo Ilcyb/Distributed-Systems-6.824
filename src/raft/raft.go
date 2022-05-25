@@ -23,13 +23,13 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
-	"github.com/sasha-s/go-deadlock"
 )
 
 //
@@ -59,8 +59,7 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	// mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	mu        deadlock.Mutex      // Lock to protect shared access to this peer's state
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -275,8 +274,10 @@ func (rf *Raft) ticker() {
 		// rand.Seed(time.Now().UnixNano())
 		time.Sleep(time.Millisecond * time.Duration(rand.Intn(150)+150))
 
+		rf.mu.Lock()
 		MyDebug(dInfo, "S%d STATUS:%s Logs:%v LastIncIdx:%d Term:%d ComIdx%d AplIdx:%d",
 			rf.me, statusMap[rf.status], rf.Logs, rf.LastIncludedIndex, rf.CurrentTerm, rf.commitIndex, rf.lastApplied)
+		rf.mu.Unlock()
 
 		// 如果该server是leader的话则不需要等待心跳包
 		if rf.getStatus() == LEADER {
