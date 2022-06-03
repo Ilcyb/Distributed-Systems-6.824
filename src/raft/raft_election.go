@@ -178,7 +178,8 @@ func (rf *Raft) election() {
 	// 如果票数大于一般则选举成功
 	switch result {
 	case ELECTION_SUCCESS:
-		rf.setStatus(LEADER)
+		rf.mu.Lock()
+		rf.status = LEADER
 		MyDebug(dVote, "S%d win election", rf.me)
 		MyDebug(dStatus, "S%d -> LEADER", rf.me)
 		// 对所有服务器发送日志追加消息
@@ -192,6 +193,7 @@ func (rf *Raft) election() {
 		for i := range rf.matchIndex {
 			rf.matchIndex[i] = 0
 		}
+		rf.mu.Unlock()
 		// rf.matchIndex[rf.me] = lastestIdx
 		go rf.appendEntriesLoop()
 	case ELECTION_FAILED:

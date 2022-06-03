@@ -38,7 +38,9 @@ func (rf *Raft) appendEntriesLoop() {
 				continue
 			}
 
+			rf.mu.Lock()
 			prevLogIndex := rf.nextIndex[i] - 1
+			rf.mu.Unlock()
 			if prevLogIndex >= rf.LastIncludedIndex {
 				go rf.appendEntries(i)
 			} else {
@@ -46,7 +48,7 @@ func (rf *Raft) appendEntriesLoop() {
 			}
 		}
 
-		time.Sleep(HAERTSBEAT_INTERVAL)
+		time.Sleep(HAERTSBEAT_INTERVAL * time.Millisecond)
 	}
 }
 
@@ -66,12 +68,10 @@ func (rf *Raft) appendEntries(server int) {
 	if prevLogIndex < 1 {
 		prevLogTerm = -1
 	} else {
-		// prevLogTerm = rf.Logs[prevLogIndex-1].Term
 		prevLogTerm = rf.getLog(prevLogIndex).Term
 	}
 
 	for i := prevLogIndex + 1; i <= rf.getLogLen(); i++ {
-		// entries = append(entries, rf.Logs[i-1])
 		entries = append(entries, rf.getLog(i))
 	}
 	rf.mu.Unlock()
@@ -136,17 +136,11 @@ func (rf *Raft) appendEntries(server int) {
 			mid = len(copyMatch) / 2
 		}
 		rf.commitIndex = copyMatch[mid]
-		// rf.MyDPrint("LEADER#%d sorted match:%v\n", rf.me, copyMatch)
-		// rf.MyDPrint("LEADER#%d majority match:%d\n", rf.me, majorityMatch)
-		// rf.MyDPrint("LEADER#%d rf.commitIndex:%d\n", rf.me, rf.commitIndex)
-		// rf.MyDPrint("LEADER#%d rf.logs:%v\n", rf.me, rf.Logs)
-		// if rf.commitIndex > rf.lastApplied && rf.Logs[rf.commitIndex-1].Term == rf.CurrentTerm {
 		needApplyMsgs := make([]ApplyMsg, 0)
 		if rf.commitIndex > rf.lastApplied && rf.getLog(rf.commitIndex).Term == rf.CurrentTerm {
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				applyMsg := ApplyMsg{
 					CommandValid: true,
-					// Command:      rf.Logs[i-1].Command,
 					Command:      rf.getLog(i).Command,
 					CommandIndex: i,
 				}
@@ -168,7 +162,6 @@ func (rf *Raft) appendEntries(server int) {
 			if reply.ConflictTermFirstIndex == 0 {
 				rf.nextIndex[server] = 1
 			} else {
-				// if rf.Logs[reply.ConflictTermFirstIndex-1].Term == reply.ConflictTerm {
 				if rf.getLog(reply.ConflictTermFirstIndex).Term == reply.ConflictTerm {
 					rf.nextIndex[server] = reply.ConflictTermFirstIndex + 1
 				} else {
@@ -184,7 +177,6 @@ func (rf *Raft) appendEntries(server int) {
 		MyDebug(dLog, "S%d -> S%d change NextIndex %d -> %d", rf.me, server, beforeNextIndex, rf.nextIndex[server])
 		rf.mu.Unlock()
 	}
-	// rf.mu.Unlock()
 }
 
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {

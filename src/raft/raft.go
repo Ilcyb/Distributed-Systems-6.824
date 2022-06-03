@@ -104,7 +104,7 @@ const (
 )
 
 const (
-	HAERTSBEAT_INTERVAL     = 150 * time.Millisecond
+	HAERTSBEAT_INTERVAL     = 30
 	ELECTION_FAILED_TIMEOUT = 1000 * time.Millisecond
 )
 
@@ -272,7 +272,7 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		rand.Seed(int64(rf.me))
 		// rand.Seed(time.Now().UnixNano())
-		time.Sleep(time.Millisecond * time.Duration(rand.Intn(150)+150))
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(HAERTSBEAT_INTERVAL)+HAERTSBEAT_INTERVAL))
 
 		rf.mu.Lock()
 		MyDebug(dInfo, "S%d STATUS:%s Logs:%v LastIncIdx:%d Term:%d ComIdx%d AplIdx:%d",
@@ -375,8 +375,8 @@ func (rf *Raft) getLog(index int) Log {
 		return Log{Term: -1}
 	}
 
-	MyDebug(dTrace, "S%d logTotalLen:%d len(logs):%d X:%d requestIndex:%d index-rf.XIndex-1:%d",
-		rf.me, logLen, len(rf.Logs), rf.LastIncludedIndex, index, index-rf.LastIncludedIndex-1)
+	// MyDebug(dTrace, "S%d logTotalLen:%d len(logs):%d X:%d requestIndex:%d index-rf.XIndex-1:%d",
+	// 	rf.me, logLen, len(rf.Logs), rf.LastIncludedIndex, index, index-rf.LastIncludedIndex-1)
 	return rf.Logs[index-rf.LastIncludedIndex-1]
 }
 
@@ -391,6 +391,10 @@ func (rf *Raft) setLog(index int, log Log) {
 
 func (rf *Raft) getLogLen() int {
 	return rf.LastIncludedIndex + len(rf.Logs)
+}
+
+func (rf *Raft) IsLeader() bool {
+	return rf.getStatus() == LEADER
 }
 
 //

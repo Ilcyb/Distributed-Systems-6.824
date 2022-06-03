@@ -4,7 +4,22 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeout     = "ErrTimeout"
 )
+
+const (
+	GET    = 0
+	PUT    = 1
+	APPEND = 2
+)
+
+const CONSENSUS_TIMEOUT = 500
+
+var opNameMap = map[int]string{
+	GET:    "GET",
+	PUT:    "PUT",
+	APPEND: "APPEND",
+}
 
 type Err string
 
@@ -16,10 +31,12 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	SerialNo uint64
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err      Err
+	SerialNo uint64
 }
 
 type GetArgs struct {
