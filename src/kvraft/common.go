@@ -5,6 +5,7 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeout     = "ErrTimeout"
+	Executed       = "Executed"
 )
 
 const (
@@ -14,6 +15,7 @@ const (
 )
 
 const CONSENSUS_TIMEOUT = 500
+const APPLY_CHAN_DELETE_TIMEOUT = 500
 
 var opNameMap = map[int]string{
 	GET:    "GET",
@@ -31,17 +33,17 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	SerialNo uint64
+	SerialNo int64
 }
 
 type PutAppendReply struct {
-	Err      Err
-	SerialNo uint64
+	Err Err
 }
 
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	SerialNo int64
 }
 
 type GetReply struct {

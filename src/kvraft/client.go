@@ -20,8 +20,12 @@ func nrand() int64 {
 	return x
 }
 
-func randServerNo(servers []*labrpc.ClientEnd) int {
-	return int(nrand() % int64(len(servers)))
+func randServerNo(prevServerNo int, servers []*labrpc.ClientEnd) int {
+	newRandomServerNo := int(nrand() % int64(len(servers)))
+	for newRandomServerNo == prevServerNo {
+		newRandomServerNo = int(nrand() % int64(len(servers)))
+	}
+	return newRandomServerNo
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
@@ -48,7 +52,8 @@ func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 	getArgs := GetArgs{
-		Key: key,
+		Key:      key,
+		SerialNo: nrand(),
 	}
 
 	getReply := GetReply{}
@@ -56,15 +61,15 @@ func (ck *Clerk) Get(key string) string {
 	if ck.leader == -1 {
 		return ck.getDetermineLeader(&getArgs, &getReply)
 	} else {
-		DPrintf("Client -> S%d - request GET(Key:%s)", ck.leader, key)
+		DPrintf(dClark, "Clark -> Client%d - request GET(Key:%s)", ck.leader, key)
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &getArgs, &getReply)
 		if !ok {
-			DPrintf("Client cannot connect old leader S%d", ck.leader)
+			DPrintf(dClark, "Clark cannot connect old leader Client%d", ck.leader)
 		} else if getReply.Err != OK {
-			DPrintf("Client <- S%d - request GET(Key:%s) received error message:%s", ck.leader, key, getReply.Err)
+			DPrintf(dClark, "Clark <- Client%d - request GET(Key:%s) received error message:%s", ck.leader, key, getReply.Err)
 		}
 		if ok && getReply.Err == OK {
-			DPrintf("Client <- S%d - request GET(Key:%s) success", ck.leader, getArgs.Key)
+			DPrintf(dClark, "Clark <- Client%d - request GET(Key:%s) success and get the VALUE:%s", ck.leader, getArgs.Key, getReply.Value)
 			return getReply.Value
 		}
 		return ck.getDetermineLeader(&getArgs, &getReply)
@@ -84,29 +89,29 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	putAppendArgs := PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		SerialNo: nrand(),
 	}
 	putAppendReply := PutAppendReply{}
 	if ck.leader == -1 {
 		ck.putDetermineLeader(&putAppendArgs, &putAppendReply)
 	} else {
-		DPrintf("Client -> S%d - request %s(Key:%s, Value:%s, SerialNo:%d)",
-			ck.leader, op, key, value, putAppendReply.SerialNo)
+		DPrintf(dClark, "Clark -> Client%d - request %s(Key:%s, Value:%s, SerialNo:%d)",
+			ck.leader, op, key, value, putAppendArgs.SerialNo)
 		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &putAppendArgs, &putAppendReply)
 		if !ok {
-			DPrintf("Client cannot connect old leader S%d", ck.leader)
+			DPrintf(dClark, "Clark cannot connect old leader Client%d", ck.leader)
 		} else if putAppendReply.Err != OK {
-			DPrintf("Client <- S%d - request %s(Key:%s, Value:%s, SerialNo:%d) received error message:%s",
-				ck.leader, op, key, value, putAppendReply.SerialNo, putAppendReply.Err)
+			DPrintf(dClark, "Clark <- Client%d - request %s(Key:%s, Value:%s, SerialNo:%d) received error message:%s",
+				ck.leader, op, key, value, putAppendArgs.SerialNo, putAppendReply.Err)
 		}
 		if ok && putAppendReply.Err == OK {
-			DPrintf("Client <- S%d - request %s(Key:%s, Value:%s, SerialNo:%d) success",
-				ck.leader, op, key, value, putAppendReply.SerialNo)
+			DPrintf(dClark, "Clark <- Client%d - request %s(Key:%s, Value:%s, SerialNo:%d) success",
+				ck.leader, op, key, value, putAppendArgs.SerialNo)
 			return
 		}
-		putAppendArgs.SerialNo = putAppendReply.SerialNo
 		ck.putDetermineLeader(&putAppendArgs, &putAppendReply)
 	}
 }
@@ -119,45 +124,46 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 func (ck *Clerk) getDetermineLeader(getArgs *GetArgs, getReply *GetReply) string {
+	var serverNo int
 	for {
-		serverNo := randServerNo(ck.servers)
-		DPrintf("Client -> S%d - request GET(Key:%s)", serverNo, getArgs.Key)
+		serverNo = randServerNo(serverNo, ck.servers)
+		DPrintf(dClark, "Clark -> Client%d - request GET(Key:%s)", serverNo, getArgs.Key)
 		getReply.Err = OK
 		ok := ck.servers[serverNo].Call("KVServer.Get", getArgs, getReply)
 		if !ok {
-			DPrintf("Client cannot connect S%d", serverNo)
+			DPrintf(dClark, "Clark cannot connect Client%d", serverNo)
 			continue
 		}
 		if getReply.Err == OK {
 			ck.leader = serverNo
-			DPrintf("Client <- S%d - request GET(Key:%s) success", serverNo, getArgs.Key)
+			DPrintf(dClark, "Clark <- Client%d - request GET(Key:%s) success and get the VALUE:%s", serverNo, getArgs.Key, getReply.Value)
 			return getReply.Value
 		} else {
-			DPrintf("Client <- S%d - request GET(Key:%s) received error message:%s", serverNo, getArgs.Key, getReply.Err)
+			DPrintf(dClark, "Clark <- Client%d - request GET(Key:%s) received error message:%s", serverNo, getArgs.Key, getReply.Err)
 		}
 	}
 }
 
 func (ck *Clerk) putDetermineLeader(putArgs *PutAppendArgs, putReply *PutAppendReply) {
+	var serverNo int
 	for {
-		serverNo := randServerNo(ck.servers)
-		DPrintf("Client -> S%d - request %s(Key:%s, Value:%s, SerialNo:%d)",
-			serverNo, putArgs.Op, putArgs.Key, putArgs.Value, putReply.SerialNo)
+		serverNo = randServerNo(serverNo, ck.servers)
+		DPrintf(dClark, "Clark -> Client%d - request %s(Key:%s, Value:%s, SerialNo:%d)",
+			serverNo, putArgs.Op, putArgs.Key, putArgs.Value, putArgs.SerialNo)
 		putReply.Err = OK
 		ok := ck.servers[serverNo].Call("KVServer.PutAppend", putArgs, putReply)
 		if !ok {
-			DPrintf("Client cannot connect S%d", serverNo)
+			DPrintf(dClark, "Clark cannot connect Client%d", serverNo)
 			continue
 		}
 		if putReply.Err == OK {
 			ck.leader = serverNo
-			DPrintf("Client <- S%d - request %s(Key:%s, Value:%s, SerialNo:%d) success",
-				serverNo, putArgs.Op, putArgs.Key, putArgs.Value, putReply.SerialNo)
+			DPrintf(dClark, "Clark <- Client%d - request %s(Key:%s, Value:%s, SerialNo:%d) success",
+				serverNo, putArgs.Op, putArgs.Key, putArgs.Value, putArgs.SerialNo)
 			return
 		} else {
-			DPrintf("Client <- S%d - request %s(Key:%s, Value:%s, SerialNo:%d) received error message:%s",
-				serverNo, putArgs.Op, putArgs.Key, putArgs.Value, putReply.SerialNo, putReply.Err)
-			putArgs.SerialNo = putReply.SerialNo
+			DPrintf(dClark, "Clark <- Client%d - request %s(Key:%s, Value:%s, SerialNo:%d) received error message:%s",
+				serverNo, putArgs.Op, putArgs.Key, putArgs.Value, putArgs.SerialNo, putReply.Err)
 		}
 	}
 }

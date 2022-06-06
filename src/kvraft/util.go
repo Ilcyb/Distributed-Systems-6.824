@@ -24,6 +24,14 @@ func getVerbosity() int {
 var debugStart time.Time
 var debugVerbosity int
 
+type logTopic string
+
+const (
+	dClark    logTopic = "CLAK"
+	dKVClient logTopic = "KVCL"
+	dKVServer logTopic = "KVSV"
+)
+
 func init() {
 	debugVerbosity = getVerbosity()
 	debugStart = time.Now()
@@ -31,11 +39,11 @@ func init() {
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
-func DPrintf(format string, a ...interface{}) {
+func DPrintf(topic logTopic, format string, a ...interface{}) {
 	if debugVerbosity >= 1 {
-		time := time.Since(debugStart).Milliseconds()
-		// time /= 100
-		prefix := fmt.Sprintf("%06d ", time)
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
 		format = prefix + format
 		log.Printf(format, a...)
 	}
