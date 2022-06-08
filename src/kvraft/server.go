@@ -30,9 +30,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	commandTable map[int64]bool
-	chanTable    map[int64]chan raft.ApplyMsg
-	kvMap        map[string]string
+	CommandTable              map[int64]bool
+	ChanTable                 map[int64]chan raft.ApplyMsg
+	KvMap                     map[string]string
+	latestAppliedRaftLogIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -45,17 +46,19 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	DPrintf(dKVServer, "K%d received command(Op:%s, Key:%s, SeriNo:%d)",
 		kv.me, opNameMap[command.Operate], command.Object, command.SerialNo)
 
-	_, err := kv.startRaft(command)
+	applyMsg, err := kv.startRaft(command)
 	if err != OK {
 		reply.Err = Err(err)
 		return
 	}
 
+	applyCommand := applyMsg.Command.(Op)
+	kv.executeCommand(applyCommand, applyMsg.CommandIndex)
 	DPrintf(dKVServer, "K%d executed command(Op:%s, Key:%s, SerialNo:%d)",
 		kv.me, opNameMap[command.Operate], command.Object, command.SerialNo)
 
 	kv.mu.Lock()
-	reply.Value = kv.kvMap[args.Key]
+	reply.Value = kv.KvMap[args.Key]
 	kv.mu.Unlock()
 	reply.Err = OK
 }
@@ -88,9 +91,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	applyCommand := applyMsg.Command.(Op)
 	kv.mu.Lock()
-	if executed := kv.commandTable[applyCommand.SerialNo]; !executed {
-		kv.executeCommand(applyCommand)
-		kv.commandTable[applyCommand.SerialNo] = true
+	if executed := kv.CommandTable[applyCommand.SerialNo]; !executed {
+		kv.executeCommand(applyCommand, applyMsg.CommandIndex)
+		kv.CommandTable[applyCommand.SerialNo] = true
 	} else {
 		DPrintf(dKVServer, "K%d Drop repeated command applyMsg(command:%v)", kv.me, applyCommand)
 	}
@@ -111,10 +114,10 @@ func (kv *KVServer) startRaft(command Op) (raft.ApplyMsg, string) {
 
 	applyCh := make(chan raft.ApplyMsg)
 	kv.mu.Lock()
-	if _, exists := kv.commandTable[command.SerialNo]; !exists {
-		kv.commandTable[command.SerialNo] = false
+	if _, exists := kv.CommandTable[command.SerialNo]; !exists {
+		kv.CommandTable[command.SerialNo] = false
 	}
-	kv.chanTable[command.SerialNo] = applyCh
+	kv.ChanTable[command.SerialNo] = applyCh
 	kv.mu.Unlock()
 
 	DPrintf(dKVServer, "K%d started command(Op:%s, Key:%s, Value:%s, Idx:%d, Term:%d, SeriNo:%d)",
@@ -134,7 +137,7 @@ func (kv *KVServer) startRaft(command Op) (raft.ApplyMsg, string) {
 	}
 
 	kv.mu.Lock()
-	delete(kv.chanTable, command.SerialNo)
+	delete(kv.ChanTable, command.SerialNo)
 	kv.mu.Unlock()
 
 	return applyMsg, err
@@ -164,10 +167,10 @@ func (kv *KVServer) applyCommandMsg(applyMsg raft.ApplyMsg) {
 	kv.mu.Lock()
 
 	// commandTable中存在该serialNo，说明该Server需要向Client返回响应
-	if executed, exists := kv.commandTable[applyCommand.SerialNo]; exists {
+	if executed, exists := kv.CommandTable[applyCommand.SerialNo]; exists {
 
 		// commandTable中存在且有管道在等待
-		if applyCommandCh, chanExists := kv.chanTable[applyCommand.SerialNo]; chanExists {
+		if applyCommandCh, chanExists := kv.ChanTable[applyCommand.SerialNo]; chanExists {
 			kv.mu.Unlock()
 			if applyCommandCh != nil {
 				select {
@@ -180,15 +183,21 @@ func (kv *KVServer) applyCommandMsg(applyMsg raft.ApplyMsg) {
 		} else if !executed {
 			// commandTabke中存在、没管道在等待且没被执行过
 			DPrintf(dKVServer, "K%d kv applyChain[%d] is not exists, a timeout command has been executed", kv.me, applyCommand.SerialNo)
-			kv.executeCommand(applyCommand)
-			kv.commandTable[applyCommand.SerialNo] = true
+			kv.executeCommand(applyCommand, applyMsg.CommandIndex)
+			kv.CommandTable[applyCommand.SerialNo] = true
+			kv.mu.Unlock()
+			return
+		} else if executed {
+			DPrintf(dKVServer, "K%d skip repeat command(Op:%s, Key:%s, Value:%s, Idx:%d, SeriNo:%d)",
+				kv.me, opNameMap[applyCommand.Operate], applyCommand.Object, applyCommand.Value,
+				applyMsg.CommandIndex, applyCommand.SerialNo)
 			kv.mu.Unlock()
 			return
 		}
 	} else {
 		// 是其他Raft server start 的命令，因此在自己的commandTable中没有记录，只需要执行而不需要响应
-		kv.executeCommand(applyCommand)
-		kv.commandTable[applyCommand.SerialNo] = true
+		kv.executeCommand(applyCommand, applyMsg.CommandIndex)
+		kv.CommandTable[applyCommand.SerialNo] = true
 		kv.mu.Unlock()
 		return
 	}
@@ -197,6 +206,10 @@ func (kv *KVServer) applyCommandMsg(applyMsg raft.ApplyMsg) {
 }
 
 func (kv *KVServer) applySnapshotMsg(applyMsg raft.ApplyMsg) {
+	kv.mu.Lock()
+	kv.latestAppliedRaftLogIndex = applyMsg.SnapshotIndex
+	kv.mu.Unlock()
+	kv.readSnapshotData(applyMsg.Snapshot)
 }
 
 func (kv *KVServer) commandTableGCLoop() {
@@ -216,13 +229,16 @@ func (kv *KVServer) commandTableGCLoop() {
 	}
 }
 
-func (kv *KVServer) executeCommand(command Op) {
+func (kv *KVServer) executeCommand(command Op, raftLogIndex int) {
+	if raftLogIndex > kv.latestAppliedRaftLogIndex {
+		kv.latestAppliedRaftLogIndex = raftLogIndex
+	}
 	if command.Operate == PUT {
-		kv.kvMap[command.Object] = command.Value
+		kv.KvMap[command.Object] = command.Value
 		DPrintf(dKVServer, "K%d executed command(Op:%s, Key:%s, Value:%s, SerialNo:%d)",
 			kv.me, opNameMap[command.Operate], command.Object, command.Value, command.SerialNo)
 	} else if command.Operate == APPEND {
-		kv.kvMap[command.Object] += command.Value
+		kv.KvMap[command.Object] += command.Value
 		DPrintf(dKVServer, "K%d executed command(Op:%s, Key:%s, Value:%s, SerialNo:%d)",
 			kv.me, opNameMap[command.Operate], command.Object, command.Value, command.SerialNo)
 	} else if command.Operate == GET {
@@ -283,12 +299,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.commandTable = make(map[int64]bool)
-	kv.chanTable = make(map[int64]chan raft.ApplyMsg)
-	kv.kvMap = make(map[string]string)
+	kv.CommandTable = make(map[int64]bool)
+	kv.ChanTable = make(map[int64]chan raft.ApplyMsg)
+	kv.KvMap = make(map[string]string)
+	kv.latestAppliedRaftLogIndex = 0
 
 	go kv.applyLoop()
 	go kv.commandTableGCLoop()
+	go kv.snapshotLoop(persister)
 
 	return kv
 }
